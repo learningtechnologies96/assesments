@@ -3,7 +3,7 @@ pipeline {
 
     environment {
         AWS_REGION = 'ap-south-1'
-        AWS_ACCOUNT_ID = '713881831635'
+        AWS_ACCOUNT_ID = '71*******35'
         ECR_REPO = 'react-login-app'
         IMAGE_TAG = "${env.BUILD_NUMBER}"
         ECS_CLUSTER = 'my-ecs-cluster'
