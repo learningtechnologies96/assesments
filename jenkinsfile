@@ -1,0 +1,141 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION = 'ap-south-1'
+        AWS_ACCOUNT_ID = '713881831635'
+        ECR_REPO = 'react-login-app'
+        IMAGE_TAG = "${env.BUILD_NUMBER}"
+        ECS_CLUSTER = 'my-ecs-cluster'
+        ECS_SERVICE = 'react-login-service'
+        ECS_TASK_DEFINITION = 'react-login-task'
+        CONTAINER_NAME = 'react-login-container'
+    }
+
+    stages {
+        stage('Checkout Code') {
+            steps {
+                script {
+                    checkout([$class: 'GitSCM', 
+                        branches: [[name: '*/main']], 
+                        userRemoteConfigs: [[
+                            credentialsId: 'GithubRepository', 
+                            url: 'git@github.com:learningtechnologies96/react-login-app.git'
+                        ]]
+                    ])
+                }
+            }
+        }
+
+        stage('Login to AWS ECR') {
+            steps {
+                script {
+                    sh """
+                    aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                    """
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    sh "docker build -t ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG} ."
+                }
+            }
+        }
+
+        stage('Push Docker Image to ECR') {
+            steps {
+                script {
+                    sh "docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Update ECS Task Definition') {
+            steps {
+                script {
+                    // Get current task definition
+                    sh """
+                    aws ecs describe-task-definition \
+                        --task-definition ${ECS_TASK_DEFINITION} \
+                        --query 'taskDefinition' \
+                        > current-task-definition.json
+                    """
+                    
+                    // Process JSON to update image
+                    sh """
+                    # Check if jq exists, if not install it (without sudo)
+                    if ! command -v jq &> /dev/null && [ -f /etc/os-release ]; then
+                        echo "Installing jq..."
+                        if grep -q "debian" /etc/os-release; then
+                            apt-get update && apt-get install -y jq
+                        elif grep -q "amzn" /etc/os-release; then
+                            yum install -y jq
+                        fi
+                    fi
+                    
+                    # Update the container image
+                    jq \
+                        --arg IMAGE "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}" \
+                        --arg CONTAINER "${CONTAINER_NAME}" \
+                        '.containerDefinitions |= map(if .name == \$CONTAINER then .image = \$IMAGE else . end)' \
+                        current-task-definition.json > updated-task-definition.json
+                    
+                    # Remove unwanted fields
+                    jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+                        updated-task-definition.json > new-task-definition.json
+                    """
+                    
+                    // Register new task definition and capture revision
+                    def NEW_REVISION = sh(
+                        script: """
+                        aws ecs register-task-definition \
+                            --cli-input-json file://new-task-definition.json \
+                            --query 'taskDefinition.revision' \
+                            --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    
+                    echo "Registered new revision: ${NEW_REVISION}"
+                    env.NEW_REVISION = NEW_REVISION
+                }
+            }
+        }
+
+        stage('Update ECS Service') {
+            steps {
+                script {
+                    sh """
+                    aws ecs update-service \
+                        --cluster ${ECS_CLUSTER} \
+                        --service ${ECS_SERVICE} \
+                        --task-definition ${ECS_TASK_DEFINITION}:${env.NEW_REVISION} \
+                        --force-new-deployment
+                    
+                    # Wait for deployment to complete with timeout
+                    aws ecs wait services-stable \
+                        --cluster ${ECS_CLUSTER} \
+                        --services ${ECS_SERVICE} \
+                        --max-attempts 30 \
+                        --delay 10
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Pipeline execution completed"
+        }
+        success {
+            echo "Deployment succeeded! New revision: ${env.NEW_REVISION}"
+        }
+        failure {
+            echo "Deployment failed. Check logs for details."
+        }
+    }
+}
